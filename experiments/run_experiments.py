@@ -1,330 +1,237 @@
 """Budget Guru – Experiments runner.
 
 Runs all combinations of prompt variants × model names against the full
-Budget Guru dataset, applies evaluators, and prints a summary table.
-Results are also forwarded to Datadog LLM Experiments via stub helpers
-that can be filled in once the SDK is available.
+Budget Guru dataset using Datadog LLM Experiments SDK.
 
 Usage:
     python -m experiments.run_experiments \\
         --dataset ./datasets/budget_guru_investment_qa.csv \\
-        --models model_A model_B \\
+        --models gpt-4.5 \\
         --prompts P1 P2 P3 P4
 """
 
 from __future__ import annotations
 
 import argparse
-import dataclasses
 import logging
 import os
 import sys
-from typing import Any
+from typing import Any, Dict, Optional
 
-from experiments.datasets import DatasetRecord, create_or_get_dataset_in_datadog, load_budget_guru_dataset
-from experiments.evaluators import EVALUATORS
+from dotenv import load_dotenv
+load_dotenv()
+
 from app.config import config
 from app.llm_client import LLMClient
 from app.prompts import get_system_prompt
+from app.datadog_instrumentation import init_tracer
 
 logging.basicConfig(level=logging.INFO, format="%(levelname)s %(message)s")
 logger = logging.getLogger(__name__)
 
-
-# ---------------------------------------------------------------------------
-# Data classes
-# ---------------------------------------------------------------------------
-
-
-@dataclasses.dataclass
-class ExperimentConfig:
-    """Describes a single experiment run (one model × one prompt variant)."""
-
-    model_name: str
-    prompt_variant: str
-
-
-@dataclasses.dataclass
-class EvalResult:
-    """Evaluation outcome for a single dataset record in one experiment."""
-
-    record_id: str
-    model_name: str
-    prompt_variant: str
-    output: str
-    scores: dict[str, float | bool]
+# Datadog LLM Obs の初期化（Experiments でもトレースを残す）
+init_tracer()
 
 
 # ---------------------------------------------------------------------------
-# Datadog Experiments integration stubs
+# Evaluators
 # ---------------------------------------------------------------------------
 
+def _extract_str(value: Any) -> str:
+    """SDK が dict で渡してくる場合に文字列を取り出すヘルパー。"""
+    if isinstance(value, dict):
+        # {"expected_output": "..."} or {"output": "..."} の形式に対応
+        return str(next(iter(value.values()), ""))
+    return str(value or "")
 
-def log_experiment_result_to_datadog(
-    dataset_id: str,
-    experiment_config: ExperimentConfig,
-    record: DatasetRecord,
-    output: str,
-    evals: dict[str, Any],
-) -> None:
-    """Send a single evaluation result to Datadog LLM Experiments.
 
-    This is a *stub*.  Replace the body with the real SDK call once available.
-
-    Expected Datadog API interaction:
-        POST /api/v2/llm-obs/experiments/{experiment_id}/events
-        Body: {
-            "data": {
-                "type": "experiment_events",
-                "attributes": {
-                    "dataset_id": dataset_id,
-                    "input": record.input,
-                    "output": output,
-                    "expected_output": record.expected_output,
-                    "evaluations": evals,
-                    "tags": {
-                        "model": experiment_config.model_name,
-                        "prompt_variant": experiment_config.prompt_variant,
-                        "topic": record.topic,
-                        "difficulty": record.difficulty,
-                    }
-                }
-            }
-        }
-
-    Reference: https://docs.datadoghq.com/llm_observability/experiments/
-
-    Args:
-        dataset_id: The Datadog dataset ID returned by create_or_get_dataset_in_datadog().
-        experiment_config: Model and prompt metadata for this run.
-        record: The dataset row being evaluated.
-        output: The LLM-generated answer.
-        evals: Dict of evaluator name → score.
-    """
-    # [Datadog LLM Experiments SDK] Replace stub below:
-    #   from ddtrace.llmobs.experiments import Experiment
-    #   experiment = Experiment.get_or_create(
-    #       name=f"{experiment_config.model_name}-{experiment_config.prompt_variant}",
-    #       dataset_id=dataset_id,
-    #       ml_app=config.DD_LLMOBS_ML_APP,
-    #   )
-    #   experiment.log(
-    #       input=record.input,
-    #       output=output,
-    #       expected_output=record.expected_output,
-    #       evaluations=evals,
-    #       tags={...},
-    #   )
-    logger.debug(
-        "[stub] log_experiment_result_to_datadog: dataset_id=%s record_id=%s evals=%s",
-        dataset_id,
-        record.id,
-        evals,
+def contains_keywords_eval(
+    input_data: Dict[str, Any],
+    output_data: Any,
+    expected_output: Any,
+) -> float:
+    """重要キーワードの網羅率を 0〜1 で返す deterministic evaluator。"""
+    import re
+    expected = _extract_str(expected_output)
+    output = _extract_str(output_data)
+    STOP_WORDS = {
+        "that", "this", "with", "from", "they", "have", "more", "than",
+        "your", "also", "when", "some", "what", "just", "into", "over",
+    }
+    # 日本語対応：4文字以上のひらがな・カタカナ・漢字も対象にする
+    keywords = set(
+        w for w in re.findall(r"\b[a-z]{4,}\b|[぀-鿿]{2,}", expected.lower())
+        if w not in STOP_WORDS
     )
+    if not keywords:
+        return 1.0
+    output_lower = output.lower()
+    matched = sum(1 for kw in keywords if kw in output_lower)
+    return round(matched / len(keywords), 4)
 
 
-# ---------------------------------------------------------------------------
-# Core experiment logic
-# ---------------------------------------------------------------------------
-
-
-def run_single_experiment(
-    experiment_config: ExperimentConfig,
-    records: list[DatasetRecord],
-    llm_client: LLMClient,
-    dataset_id: str,
-) -> list[EvalResult]:
-    """Run one model × prompt combination over all dataset records.
-
-    For each record:
-    1. Generate an answer with the LLM.
-    2. Apply all evaluators.
-    3. Forward results to Datadog (stub).
-
-    Args:
-        experiment_config: Model name and prompt variant for this run.
-        records: All dataset rows to evaluate.
-        llm_client: Shared LLM client instance.
-        dataset_id: Datadog dataset ID for logging.
-
-    Returns:
-        List of EvalResult, one per dataset record.
-    """
-    system_prompt = get_system_prompt(experiment_config.prompt_variant)
-    results: list[EvalResult] = []
-
-    for record in records:
+def make_llm_accuracy_eval(llm_client: LLMClient):
+    """information_accuracy の LLM-as-a-judge evaluator を返すファクトリ。"""
+    def information_accuracy(
+        input_data: Dict[str, Any],
+        output_data: Any,
+        expected_output: Any,
+    ) -> float:
+        expected = _extract_str(expected_output)
+        output = _extract_str(output_data)
+        judge_prompt = (
+            f"模範回答: {expected}\n"
+            f"モデルの回答: {output}\n"
+            "モデルの回答が模範回答の内容をどれだけ正確かつ網羅的にカバーしているかを"
+            "0.0〜1.0のスコアで評価してください。数字のみを返してください。"
+        )
         try:
-            output = llm_client.generate(
-                system_prompt=system_prompt,
-                user_message=record.input,
-                metadata={
-                    "experiment": True,
-                    "model": experiment_config.model_name,
-                    "prompt_variant": experiment_config.prompt_variant,
-                    "record_id": record.id,
-                },
+            raw = llm_client.generate(
+                system_prompt="あなたは厳格で公平な評価者です。",
+                user_message=judge_prompt,
             )
-        except Exception as exc:  # noqa: BLE001
-            logger.error(
-                "LLM call failed for record %s: %s", record.id, exc
-            )
-            output = ""
+            return max(0.0, min(1.0, float(raw.strip())))
+        except Exception as e:
+            logger.warning("information_accuracy judge failed: %s", e)
+            return 0.0
+    return information_accuracy
 
-        scores: dict[str, float | bool] = {}
-        for name, fn in EVALUATORS.items():
-            try:
-                scores[name] = fn(
-                    output=output,
-                    expected_output=record.expected_output,
-                    llm_client=llm_client,
-                )
-            except Exception as exc:  # noqa: BLE001
-                logger.warning("Evaluator %s failed for record %s: %s", name, record.id, exc)
-                scores[name] = 0.0
 
-        log_experiment_result_to_datadog(
-            dataset_id=dataset_id,
-            experiment_config=experiment_config,
-            record=record,
-            output=output,
-            evals=scores,
+def make_brand_voice_eval(llm_client: LLMClient):
+    """brand_voice_consistency の LLM-as-a-judge evaluator を返すファクトリ。"""
+    def brand_voice_consistency(
+        input_data: Dict[str, Any],
+        output_data: Any,
+        expected_output: Any,
+    ) -> bool:
+        output = _extract_str(output_data)
+        judge_prompt = (
+            f"評価する回答:\n{output}\n\n"
+            "この回答は、投資初心者の20代の若者に向けて、友達に話すような"
+            "フレンドリーでわかりやすいスタイルで書かれていますか？"
+            "「はい」または「いいえ」のみで答えてください。"
         )
-
-        results.append(
-            EvalResult(
-                record_id=record.id,
-                model_name=experiment_config.model_name,
-                prompt_variant=experiment_config.prompt_variant,
-                output=output,
-                scores=scores,
-            )
-        )
-        logger.info(
-            "  record=%s scores=%s",
-            record.id,
-            {k: round(float(v), 3) for k, v in scores.items()},
-        )
-
-    return results
-
-
-def aggregate_scores(results: list[EvalResult]) -> dict[str, float]:
-    """Compute the mean score for each evaluator across all results.
-
-    Args:
-        results: Flat list of EvalResult instances for one experiment.
-
-    Returns:
-        Dict mapping evaluator name → mean score.
-    """
-    if not results:
-        return {}
-    totals: dict[str, float] = {k: 0.0 for k in results[0].scores}
-    for r in results:
-        for k, v in r.scores.items():
-            totals[k] += float(v)
-    n = len(results)
-    return {k: round(v / n, 4) for k, v in totals.items()}
-
-
-def print_summary(all_results: dict[str, list[EvalResult]]) -> None:
-    """Print a formatted summary table of mean scores per experiment.
-
-    Args:
-        all_results: Mapping of ``"<model>/<prompt>"`` → list of EvalResult.
-    """
-    if not all_results:
-        print("No results to display.")
-        return
-
-    eval_keys = list(next(iter(all_results.values()))[0].scores.keys())
-    col_w = 14
-    header = f"{'Experiment':<30}" + "".join(f"{k:>{col_w}}" for k in eval_keys)
-    print("\n" + "=" * len(header))
-    print("Budget Guru – Experiments Summary")
-    print("=" * len(header))
-    print(header)
-    print("-" * len(header))
-
-    for label, results in sorted(all_results.items()):
-        means = aggregate_scores(results)
-        row = f"{label:<30}" + "".join(f"{means.get(k, 0.0):>{col_w}.4f}" for k in eval_keys)
-        print(row)
-
-    print("=" * len(header) + "\n")
+        try:
+            raw = llm_client.generate(
+                system_prompt="あなたは若者向けフィンテックアプリのブランドボイス評価者です。",
+                user_message=judge_prompt,
+            ).strip()
+            return raw.startswith("はい") or raw.lower().startswith("yes")
+        except Exception as e:
+            logger.warning("brand_voice_consistency judge failed: %s", e)
+            return False
+    return brand_voice_consistency
 
 
 # ---------------------------------------------------------------------------
 # CLI entry point
 # ---------------------------------------------------------------------------
 
-
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
-    """Parse CLI arguments."""
-    parser = argparse.ArgumentParser(
-        description="Run Budget Guru LLM Experiments offline."
-    )
+    parser = argparse.ArgumentParser(description="Run Budget Guru LLM Experiments.")
     parser.add_argument(
         "--dataset",
         default="./datasets/budget_guru_investment_qa.csv",
         help="Path to the Q&A CSV dataset.",
     )
     parser.add_argument(
-        "--models",
-        nargs="+",
-        default=["model_A"],
-        help="Model name(s) to evaluate (e.g. model_A model_B).",
+        "--models", nargs="+", default=["gpt-4.5"],
+        help="Model name(s) to evaluate.",
     )
     parser.add_argument(
-        "--prompts",
-        nargs="+",
-        default=["P1", "P4"],
+        "--prompts", nargs="+", default=["P1", "P4"],
         help="Prompt variant(s) to evaluate (P1–P4).",
+    )
+    parser.add_argument(
+        "--project",
+        default=config.DD_LLMOBS_PROJECT_NAME,
+        help="Datadog Experiments project name.",
     )
     return parser.parse_args(argv)
 
 
 def main(argv: list[str] | None = None) -> None:
     """Entry point for the Experiments runner."""
+    from ddtrace.llmobs import LLMObs
+
     args = parse_args(argv)
 
-    # Load dataset
-    records = load_budget_guru_dataset(args.dataset)
-    logger.info("Dataset loaded: %d records", len(records))
+    # ------------------------------------------------------------------
+    # 1. Dataset を Datadog に登録（or 既存を取得）
+    # ------------------------------------------------------------------
+    logger.info("Registering dataset: %s", args.dataset)
+    dataset = LLMObs.create_dataset_from_csv(
+        csv_path=args.dataset,
+        dataset_name="budget-guru-investment-qa",
+        project_name=args.project,
+        description="Budget Guru investment Q&A evaluation dataset",
+        input_data_columns=["input"],
+        expected_output_columns=["expected_output"],
+        metadata_columns=["topic", "difficulty", "age_group"],
+    )
+    logger.info("Dataset registered.")
 
-    # Register dataset in Datadog (stub)
-    dataset_id = create_or_get_dataset_in_datadog(records)
-    logger.info("Datadog dataset_id: %s", dataset_id)
-
-    all_results: dict[str, list[EvalResult]] = {}
-
+    # ------------------------------------------------------------------
+    # 2. model × prompt の組み合わせで Experiment を実行
+    # ------------------------------------------------------------------
     for model_name in args.models:
-        # Build an LLM client per model (base_url and api_key from env)
         llm_client = LLMClient(
             model_name=model_name,
-            api_key=config.OPENAI_API_KEY or os.getenv("OPENAI_API_KEY", ""),
+            api_key=config.OPENAI_API_KEY,
             base_url=config.OPENAI_BASE_URL,
             timeout=config.LLM_TIMEOUT,
         )
 
         for prompt_variant in args.prompts:
-            exp_cfg = ExperimentConfig(
-                model_name=model_name,
-                prompt_variant=prompt_variant,
-            )
-            label = f"{model_name}/{prompt_variant}"
-            logger.info("Running experiment: %s (%d records)", label, len(records))
+            system_prompt = get_system_prompt(prompt_variant)
+            experiment_name = f"budget-guru-{model_name}-{prompt_variant}"
+            logger.info("Running experiment: %s", experiment_name)
 
-            results = run_single_experiment(
-                experiment_config=exp_cfg,
-                records=records,
-                llm_client=llm_client,
-                dataset_id=dataset_id,
-            )
-            all_results[label] = results
+            # タスク関数：1レコードの input を受け取り LLM の回答を返す
+            # SDK の要件: 引数名は input_data と config でなければならない
+            def task(
+                input_data: Dict[str, Any],
+                config: Optional[Dict[str, Any]] = None,
+                _sp=system_prompt,
+                _client=llm_client,
+            ) -> str:
+                return _client.generate(
+                    system_prompt=_sp,
+                    user_message=input_data["input"],
+                    metadata={"prompt_variant": prompt_variant, "model": model_name},
+                )
 
-    print_summary(all_results)
+            # Evaluators
+            evaluators = [
+                contains_keywords_eval,
+                make_llm_accuracy_eval(llm_client),
+                make_brand_voice_eval(llm_client),
+            ]
+
+            # ------------------------------------------------------------------
+            # Datadog LLM Experiments SDK で実行・送信
+            # Reference: https://docs.datadoghq.com/llm_observability/experiments/setup/
+            # ------------------------------------------------------------------
+            experiment = LLMObs.experiment(
+                name=experiment_name,
+                task=task,
+                dataset=dataset,
+                evaluators=evaluators,
+                description=f"Prompt variant {prompt_variant} with model {model_name}",
+                config={"model": model_name, "prompt_variant": prompt_variant},
+            )
+
+            results = experiment.run()
+
+            # 結果サマリーをコンソールに表示
+            print(f"\n{'='*60}")
+            print(f"Experiment: {experiment_name}")
+            print(f"{'='*60}")
+            for row in results.get("rows", []):
+                print(f"  record={row.get('idx')} output={str(row.get('output',''))[:80]}")
+            print(f"\nView in Datadog: {experiment.url}")
+
+    print("\nAll experiments completed.")
 
 
 if __name__ == "__main__":

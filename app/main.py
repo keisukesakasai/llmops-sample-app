@@ -6,6 +6,9 @@ patch all supported libraries at import time.
 
 from __future__ import annotations
 
+from dotenv import load_dotenv
+load_dotenv()
+
 # Datadog must be initialized first
 from app.datadog_instrumentation import init_tracer
 

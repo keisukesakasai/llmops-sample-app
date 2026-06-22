@@ -8,7 +8,7 @@ class Config:
 
     # OpenAI / LLM
     OPENAI_API_KEY: str = os.getenv("OPENAI_API_KEY", "")
-    OPENAI_BASE_URL: str | None = os.getenv("OPENAI_BASE_URL", None)
+    OPENAI_BASE_URL: str | None = os.getenv("OPENAI_BASE_URL") or None
     LLM_MODEL: str = os.getenv("LLM_MODEL", "gpt-4.1")
     LLM_TIMEOUT: int = int(os.getenv("LLM_TIMEOUT", "30"))
 
